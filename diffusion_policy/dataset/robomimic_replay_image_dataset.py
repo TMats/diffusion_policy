@@ -19,7 +19,7 @@ from diffusion_policy.dataset.base_dataset import BaseImageDataset, LinearNormal
 from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, Jpeg2k
-from diffusion_policy.common.replay_buffer import ReplayBuffer
+from diffusion_policy.common.replay_buffer import ReplayBuffer, MemoryReplayBuffer
 from diffusion_policy.common.sampler import SequenceSampler, get_val_mask
 from diffusion_policy.common.normalize_util import (
     robomimic_abs_action_only_normalizer_from_stat,
@@ -81,7 +81,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                             src_store=zip_store, store=zarr.MemoryStore())
                     print('Loaded!')
         else:
-            replay_buffer = _convert_robomimic_to_replay(
+            replay_buffer = _convert_robomimic_to_memory_replay(
                 store=zarr.MemoryStore(), 
                 shape_meta=shape_meta, 
                 dataset_path=dataset_path, 
@@ -361,6 +361,95 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
 
     replay_buffer = ReplayBuffer(root)
     return replay_buffer
+
+
+def _convert_robomimic_to_memory_replay(store, shape_meta, dataset_path, abs_action, rotation_transformer, 
+        n_workers=None, max_inflight_tasks=None):
+    if n_workers is None:
+        n_workers = multiprocessing.cpu_count()
+    if max_inflight_tasks is None:
+        max_inflight_tasks = n_workers * 5
+
+    # parse shape_meta
+    rgb_keys = list()
+    lowdim_keys = list()
+    # construct compressors and chunks
+    obs_shape_meta = shape_meta['obs']
+    for key, attr in obs_shape_meta.items():
+        shape = attr['shape']
+        type = attr.get('type', 'low_dim')
+        if type == 'rgb':
+            rgb_keys.append(key)
+        elif type == 'low_dim':
+            lowdim_keys.append(key)
+        
+    root = MemoryReplayBuffer()
+
+    with h5py.File(dataset_path) as file:
+        # count total steps
+        demos = file['data']
+        episode_ends = list()
+        prev_end = 0
+        for i in range(len(demos)):
+            demo = demos[f'demo_{i}']
+            episode_length = demo['actions'].shape[0]
+            episode_end = prev_end + episode_length
+            prev_end = episode_end
+            episode_ends.append(episode_end)
+        n_steps = episode_ends[-1]
+        episode_starts = [0] + episode_ends[:-1]
+        root.meta['episode_ends'] = np.array(episode_ends, dtype=np.int64)
+        root.n_episodes = len(episode_ends)
+
+        # save lowdim data
+        for key in tqdm(lowdim_keys + ['action'], desc="Loading lowdim data"):
+            data_key = 'obs/' + key
+            if key == 'action':
+                data_key = 'actions'
+            this_data = list()
+            for i in range(len(demos)):
+                demo = demos[f'demo_{i}']
+                this_data.append(demo[data_key][:].astype(np.float32))
+            this_data = np.concatenate(this_data, axis=0)
+            if key == 'action':
+                this_data = _convert_actions(
+                    raw_actions=this_data,
+                    abs_action=abs_action,
+                    rotation_transformer=rotation_transformer
+                )
+                assert this_data.shape == (n_steps,) + tuple(shape_meta['action']['shape'])
+            else:
+                assert this_data.shape == (n_steps,) + tuple(shape_meta['obs'][key]['shape'])
+
+            root.data[key] = np.array(this_data, dtype=this_data.dtype).reshape(this_data.shape)
+            # root.data[key] = torch.tensor(np.array(this_data, dtype=this_data.dtype).reshape(this_data.shape), dtype=torch.uint8)
+        
+        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx):
+            try:
+                zarr_arr[zarr_idx] = hdf5_arr[hdf5_idx]
+                # make sure we can successfully decode
+                _ = zarr_arr[zarr_idx]
+                return True
+            except Exception as e:
+                return False
+        # save img data
+        for key in tqdm(rgb_keys, desc="Loading image data"):
+            data_key = 'obs/' + key
+            hdf5_arr = list()
+            for episode_idx in range(len(demos)):
+                demo = demos[f'demo_{episode_idx}']
+                # print(demo['obs'][key][:].astype(np.uint8).shape)
+                # print(demo['obs'][key][:].astype(np.uint8))
+                shape = tuple(shape_meta['obs'][key]['shape'])
+                c,h,w = shape
+                hdf5_arr.append(demo['obs'][key][:].astype(np.uint8).reshape(-1,h,w,c))
+                
+            hdf5_arr = np.concatenate(hdf5_arr, axis=0)
+            root.data[key] = np.array(hdf5_arr, dtype=hdf5_arr.dtype).reshape(hdf5_arr.shape)
+            # root.data[key] = torch.tensor(np.array(hdf5_arr, dtype=hdf5_arr.dtype).reshape(hdf5_arr.shape), dtype=torch.uint8)
+    replay_buffer = root
+    return replay_buffer
+
 
 def normalizer_from_stat(stat):
     max_abs = np.maximum(stat['max'].max(), np.abs(stat['min']).max())
