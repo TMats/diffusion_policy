@@ -31,9 +31,12 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
+
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -57,16 +60,16 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        # configure model
-        self.model: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
+        # # configure model
+        # self.model: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
 
-        self.ema_model: DiffusionUnetHybridImagePolicy = None
-        if cfg.training.use_ema:
-            self.ema_model = copy.deepcopy(self.model)
+        # self.ema_model: DiffusionUnetHybridImagePolicy = None
+        # if cfg.training.use_ema:
+        #     self.ema_model = copy.deepcopy(self.model)
 
-        # configure training state
-        self.optimizer = hydra.utils.instantiate(
-            cfg.optimizer, params=self.model.parameters())
+        # # configure training state
+        # self.optimizer = hydra.utils.instantiate(
+        #     cfg.optimizer, params=self.model.parameters())
 
         # configure training state
         self.global_step = 0
@@ -106,17 +109,17 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        train_dataloader = DataLoader(dataset, sampler=train_sampler,**cfg.dataloader)
+        # train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
 
-        self.model.set_normalizer(normalizer)
+        self.model.module.set_normalizer(normalizer)
         if cfg.training.use_ema:
-            self.ema_model.set_normalizer(normalizer)
+            self.ema_model.module.set_normalizer(normalizer)
 
         # configure lr scheduler
         lr_scheduler = get_scheduler(
@@ -139,6 +142,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 model=self.ema_model)
 
         # configure env
+        from hydra.core.hydra_config import HydraConfig
+        print(HydraConfig.get().runtime.output_dir)
         env_runner: BaseImageRunner
         env_runner = hydra.utils.instantiate(
             cfg.task.env_runner,
@@ -164,7 +169,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         )
 
         # device transfer
-        device = torch.device(cfg.training.device)
+        # device = torch.device(cfg.training.device)
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
@@ -345,9 +350,24 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
     version_base=None,
     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
     config_name=pathlib.Path(__file__).stem)
-def main(cfg):
-    workspace = TrainDiffusionUnetHybridWorkspace(cfg)
-    workspace.run()
+# def main(cfg):
+#     workspace = TrainDiffusionUnetHybridWorkspace(cfg)
+#     workspace.run()
+
+# if __name__ == "__main__":
+#     main()
+
+
+def main(cfg: OmegaConf):
+    # resolve immediately so all the ${now:} resolvers
+    # will use the same time.
+    OmegaConf.resolve(cfg)
+
+    cls = hydra.utils.get_class(cfg._target_)
+    workspace: BaseWorkspace = cls(cfg)
+    world_size = torch.cuda.device_count()
+    mp.spawn(workspace.run, args=(world_size,), nprocs=world_size, join=True)
+    
 
 if __name__ == "__main__":
     main()
