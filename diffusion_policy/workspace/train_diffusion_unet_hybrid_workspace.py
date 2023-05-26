@@ -53,6 +53,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
+        print(self.output_dir)
+        self.output_dir_base = self.output_dir
 
         # set seed
         self.seed = cfg.training.seed
@@ -142,31 +144,32 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 model=self.ema_model)
 
         # configure env
-        from hydra.core.hydra_config import HydraConfig
-        print(HydraConfig.get().runtime.output_dir)
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
+        # from hydra.core.hydra_config import HydraConfig
+        # print(HydraConfig.get().runtime.output_dir)
+        if rank == 0:
+            env_runner: BaseImageRunner
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir_base)
+            assert isinstance(env_runner, BaseImageRunner)
 
-        # configure logging
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
-        )
-        wandb.config.update(
-            {
-                "output_dir": self.output_dir,
-            }
-        )
+            # configure logging
+            wandb_run = wandb.init(
+                dir=str(self.output_dir_base),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging
+            )
+            wandb.config.update(
+                {
+                    "output_dir": self.output_dir_base,
+                }
+            )
 
-        # configure checkpoint
-        topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
-        )
+            # configure checkpoint
+            topk_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir_base, 'checkpoints'),
+                **cfg.checkpoint.topk
+            )
 
         # device transfer
         # device = torch.device(cfg.training.device)
@@ -188,7 +191,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
             cfg.training.sample_every = 1
 
         # training loop
-        log_path = os.path.join(self.output_dir, 'logs.json.txt')
+        log_path = os.path.join(self.output_dir_base, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
@@ -211,7 +214,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        raw_loss = self.model.module.compute_loss(batch)
                         
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         start_time = time.time()
@@ -236,29 +239,32 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             ema.step(self.model)
 
                         # logging
-                        raw_loss_cpu = raw_loss.item()
-                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
-                        train_losses.append(raw_loss_cpu)
-                        step_log = {
-                            'train_loss': raw_loss_cpu,
-                            'global_step': self.global_step,
-                            'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0]
-                        }
+                        if rank == 0:
+                            raw_loss_cpu = raw_loss.item()
+                            tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                            train_losses.append(raw_loss_cpu)
+                            step_log = {
+                                'train_loss': raw_loss_cpu,
+                                'global_step': self.global_step,
+                                'epoch': self.epoch,
+                                'lr': lr_scheduler.get_last_lr()[0]
+                            }
 
-                        is_last_batch = (batch_idx == (len(train_dataloader)-1))
-                        if not is_last_batch:
-                            # log of last step is combined with validation and rollout
-                            wandb_run.log(step_log, step=self.global_step)
-                            json_logger.log(step_log)
-                            self.global_step += 1
+                            is_last_batch = (batch_idx == (len(train_dataloader)-1))
+                            
+                            if not is_last_batch:
+                                # log of last step is combined with validation and rollout
+                                
+                                wandb_run.log(step_log, step=self.global_step)
+                                json_logger.log(step_log)
+                                self.global_step += 1
 
-                        if (cfg.training.max_train_steps is not None) \
-                            and batch_idx >= (cfg.training.max_train_steps-1):
-                            break
-                        start_time = time.time()
-                        print("Logger", start_time-end_time)
-                        end_time = time.time()
+                            if (cfg.training.max_train_steps is not None) \
+                                and batch_idx >= (cfg.training.max_train_steps-1):
+                                break
+                            start_time = time.time()
+                            print("Logger", start_time-end_time)
+                            end_time = time.time()
 
                 # at the end of each epoch
                 # replace train_loss with epoch average
@@ -285,7 +291,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
+                                loss = self.model.module.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
