@@ -31,6 +31,20 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+    
 class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
@@ -38,10 +52,10 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         super().__init__(cfg, output_dir=output_dir)
 
         # set seed
-        seed = cfg.training.seed
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+        self.seed = cfg.training.seed
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
 
         # configure model
         self.model: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
@@ -58,9 +72,29 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         self.global_step = 0
         self.epoch = 0
 
-    def run(self):
-        cfg = copy.deepcopy(self.cfg)
+    def run(self, rank, world_size):
+        print("rank:", rank, "world_size:", world_size)
+        setup(rank, world_size)
+        seed = self.seed + dist.get_rank()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        
+        device = f"cuda:{rank}"
 
+        cfg = copy.deepcopy(self.cfg)
+        # configure model
+        self.model: DiffusionUnetHybridImagePolicy = hydra.utils.instantiate(cfg.policy)
+        # configure the model for DDP
+        self.model = DDP(self.model)
+
+        self.ema_model: DiffusionUnetHybridImagePolicy = None
+        if cfg.training.use_ema:
+            self.ema_model = copy.deepcopy(self.model)
+
+        # configure training state
+        self.optimizer = hydra.utils.instantiate(
+            cfg.optimizer, params=self.model.parameters())
         # resume training
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
@@ -72,7 +106,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        train_dataloader = DataLoader(dataset, sampler=train_sampler,**cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
         # configure validation dataset
@@ -156,23 +191,41 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 train_losses = list()
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+                    import time
+                    end_time = time.time()
                     for batch_idx, batch in enumerate(tepoch):
+                        start_time = time.time()
+                        print("Batch", start_time-end_time)
+                        end_time = time.time()
                         # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                        start_time = time.time()
+                        print("GPU", start_time-end_time)
+                        end_time = time.time()
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
                         # compute loss
                         raw_loss = self.model.compute_loss(batch)
+                        
                         loss = raw_loss / cfg.training.gradient_accumulate_every
+                        start_time = time.time()
+                        print("Loss", start_time-end_time)
+                        end_time = time.time()
+                        
                         loss.backward()
+                        start_time = time.time()
+                        print("Backword", start_time-end_time)
+                        end_time = time.time()
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
-                        
+                            start_time = time.time()
+                            print("Optimizer", start_time-end_time)
+                            end_time = time.time()
                         # update ema
                         if cfg.training.use_ema:
                             ema.step(self.model)
@@ -198,6 +251,9 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                         if (cfg.training.max_train_steps is not None) \
                             and batch_idx >= (cfg.training.max_train_steps-1):
                             break
+                        start_time = time.time()
+                        print("Logger", start_time-end_time)
+                        end_time = time.time()
 
                 # at the end of each epoch
                 # replace train_loss with epoch average
@@ -283,6 +339,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
+        cleanup()
 
 @hydra.main(
     version_base=None,

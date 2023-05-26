@@ -13,6 +13,8 @@ import hydra
 from omegaconf import OmegaConf
 import pathlib
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
+import torch
+import torch.multiprocessing as mp
 
 # allows arbitrary python code execution in configs using the ${eval:''} resolver
 OmegaConf.register_new_resolver("eval", eval, replace=True)
@@ -22,6 +24,15 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
     config_path=str(pathlib.Path(__file__).parent.joinpath(
         'diffusion_policy','config'))
 )
+# def main(cfg: OmegaConf):
+#     # resolve immediately so all the ${now:} resolvers
+#     # will use the same time.
+#     OmegaConf.resolve(cfg)
+
+#     cls = hydra.utils.get_class(cfg._target_)
+#     workspace: BaseWorkspace = cls(cfg)
+#     workspace.run()
+
 def main(cfg: OmegaConf):
     # resolve immediately so all the ${now:} resolvers
     # will use the same time.
@@ -29,7 +40,9 @@ def main(cfg: OmegaConf):
 
     cls = hydra.utils.get_class(cfg._target_)
     workspace: BaseWorkspace = cls(cfg)
-    workspace.run()
+    world_size = torch.cuda.device_count()
+    mp.spawn(workspace.run, args=(world_size,), nprocs=world_size, join=True)
+    
 
 if __name__ == "__main__":
     main()
