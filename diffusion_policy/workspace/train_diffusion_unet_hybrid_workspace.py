@@ -161,7 +161,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         # configure env
         # from hydra.core.hydra_config import HydraConfig
         # print(HydraConfig.get().runtime.output_dir)
-        if rank == 0:
+        if False:
             env_runner: BaseImageRunner
             env_runner = hydra.utils.instantiate(
                 cfg.task.env_runner,
@@ -170,11 +170,11 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
            
 
-            # configure checkpoint
-            topk_manager = TopKCheckpointManager(
-                save_dir=os.path.join(self.output_dir_base, 'checkpoints'),
-                **cfg.checkpoint.topk
-            )
+        # configure checkpoint
+        topk_manager = TopKCheckpointManager(
+            save_dir=os.path.join(self.output_dir_base, 'checkpoints'),
+            **cfg.checkpoint.topk
+        )
 
         # device transfer
         # device = torch.device(cfg.training.device)
@@ -244,7 +244,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             ema.step(self.model)
 
                         # logging
-                        if True:
+                        if self.global_step % 100 == 0:
                             raw_loss_cpu = raw_loss.item()
                             tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                             train_losses.append(raw_loss_cpu)
