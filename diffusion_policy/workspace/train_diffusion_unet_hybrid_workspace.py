@@ -53,8 +53,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
-        print(self.output_dir)
-        self.output_dir_base = self.output_dir
+        
+        self.output_dir_base = super().output_dir
 
         # set seed
         self.seed = cfg.training.seed
@@ -76,6 +76,21 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         # configure training state
         self.global_step = 0
         self.epoch = 0
+        # configure logging
+        self.wandb_run = wandb.init(
+            dir=str(self.output_dir_base),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            **cfg.logging
+        )
+        wandb.config.update(
+            {
+                "output_dir": self.output_dir_base,
+            }
+        )
+    
+    @property
+    def output_dir(self):
+        return self.output_dir_base
 
     def run(self, rank, world_size):
         print("rank:", rank, "world_size:", world_size)
@@ -153,17 +168,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 output_dir=self.output_dir_base)
             assert isinstance(env_runner, BaseImageRunner)
 
-            # configure logging
-            wandb_run = wandb.init(
-                dir=str(self.output_dir_base),
-                config=OmegaConf.to_container(cfg, resolve=True),
-                **cfg.logging
-            )
-            wandb.config.update(
-                {
-                    "output_dir": self.output_dir_base,
-                }
-            )
+           
 
             # configure checkpoint
             topk_manager = TopKCheckpointManager(
@@ -239,7 +244,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             ema.step(self.model)
 
                         # logging
-                        if rank == 0:
+                        if True:
                             raw_loss_cpu = raw_loss.item()
                             tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                             train_losses.append(raw_loss_cpu)
@@ -255,7 +260,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             if not is_last_batch:
                                 # log of last step is combined with validation and rollout
                                 
-                                wandb_run.log(step_log, step=self.global_step)
+                                self.wandb_run.log(step_log, step=self.global_step)
                                 json_logger.log(step_log)
                                 self.global_step += 1
 
@@ -272,81 +277,82 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 step_log['train_loss'] = train_loss
 
                 # ========= eval for this epoch ==========
-                policy = self.model
-                if cfg.training.use_ema:
-                    policy = self.ema_model
-                policy.eval()
+                if rank == 0:
+                    policy = self.model.module
+                    if cfg.training.use_ema:
+                        policy = self.ema_model.module
+                    policy.eval()
 
-                # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
-                    runner_log = env_runner.run(policy)
-                    # log all
-                    step_log.update(runner_log)
+                    # run rollout
+                    # if (self.epoch % cfg.training.rollout_every) == 0:
+                    #     runner_log = env_runner.run(policy)
+                    #     # log all
+                    #     step_log.update(runner_log)
 
-                # run validation
-                if (self.epoch % cfg.training.val_every) == 0:
-                    with torch.no_grad():
-                        val_losses = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
-                                leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.module.compute_loss(batch)
-                                val_losses.append(loss)
-                                if (cfg.training.max_val_steps is not None) \
-                                    and batch_idx >= (cfg.training.max_val_steps-1):
-                                    break
-                        if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            # log epoch average validation loss
-                            step_log['val_loss'] = val_loss
+                    # run validation
+                    if (self.epoch % cfg.training.val_every) == 0:
+                        with torch.no_grad():
+                            val_losses = list()
+                            with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
+                                    leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
+                                for batch_idx, batch in enumerate(tepoch):
+                                    batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                                    loss = self.model.module.compute_loss(batch)
+                                    val_losses.append(loss)
+                                    if (cfg.training.max_val_steps is not None) \
+                                        and batch_idx >= (cfg.training.max_val_steps-1):
+                                        break
+                            if len(val_losses) > 0:
+                                val_loss = torch.mean(torch.tensor(val_losses)).item()
+                                # log epoch average validation loss
+                                step_log['val_loss'] = val_loss
 
-                # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
-                    with torch.no_grad():
-                        # sample trajectory from training set, and evaluate difference
-                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                        obs_dict = batch['obs']
-                        gt_action = batch['action']
-                        
-                        result = policy.predict_action(obs_dict)
-                        pred_action = result['action_pred']
-                        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                        step_log['train_action_mse_error'] = mse.item()
-                        del batch
-                        del obs_dict
-                        del gt_action
-                        del result
-                        del pred_action
-                        del mse
-                
-                # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0:
-                    # checkpointing
-                    if cfg.checkpoint.save_last_ckpt:
-                        self.save_checkpoint()
-                    if cfg.checkpoint.save_last_snapshot:
-                        self.save_snapshot()
-
-                    # sanitize metric names
-                    metric_dict = dict()
-                    for key, value in step_log.items():
-                        new_key = key.replace('/', '_')
-                        metric_dict[new_key] = value
+                    # run diffusion sampling on a training batch
+                    if (self.epoch % cfg.training.sample_every) == 0:
+                        with torch.no_grad():
+                            # sample trajectory from training set, and evaluate difference
+                            batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                            obs_dict = batch['obs']
+                            gt_action = batch['action']
+                            
+                            result = policy.predict_action(obs_dict)
+                            pred_action = result['action_pred']
+                            mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                            step_log['train_action_mse_error'] = mse.item()
+                            del batch
+                            del obs_dict
+                            del gt_action
+                            del result
+                            del pred_action
+                            del mse
                     
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    # checkpoint
+                    if (self.epoch % cfg.training.checkpoint_every) == 0:
+                        # checkpointing
+                        if cfg.checkpoint.save_last_ckpt:
+                            self.save_checkpoint()
+                        if cfg.checkpoint.save_last_snapshot:
+                            self.save_snapshot()
 
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
-                # ========= eval end for this epoch ==========
-                policy.train()
+                        # sanitize metric names
+                        metric_dict = dict()
+                        for key, value in step_log.items():
+                            new_key = key.replace('/', '_')
+                            metric_dict[new_key] = value
+                        
+                        # We can't copy the last checkpoint here
+                        # since save_checkpoint uses threads.
+                        # therefore at this point the file might have been empty!
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
+                    # ========= eval end for this epoch ==========
+                    policy.train()
 
                 # end of epoch
                 # log of last step is combined with validation and rollout
-                wandb_run.log(step_log, step=self.global_step)
+                self.wandb_run.log(step_log, step=self.global_step)
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
