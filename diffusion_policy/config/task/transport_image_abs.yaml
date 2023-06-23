@@ -70,6 +70,6 @@ dataset:
   abs_action: *abs_action
   rotation_rep: 'rotation_6d'
   use_legacy_normalizer: False
-  use_cache: True
+  use_cache: false
   seed: 42
   val_ratio: 0.02

@@ -586,3 +586,19 @@ class ReplayBuffer:
                 compressor = self.resolve_compressor(value)
                 if compressor != arr.compressor:
                     rechunk_recompress_array(self.data, key, compressor=compressor)
+
+
+class MemoryReplayBuffer:
+        def __init__(self):
+            self.data = {}
+            self.meta = {}
+            self.n_episodes = 0
+        
+        @property
+        def episode_ends(self):
+            return self.meta['episode_ends']
+        
+        def keys(self):
+            return self.data.keys()
+        def __getitem__(self, key):
+            return self.data[key]
