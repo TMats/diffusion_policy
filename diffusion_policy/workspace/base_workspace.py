@@ -9,6 +9,10 @@ import dill
 import torch
 import threading
 
+# @hydra.main(
+#     version_base=None,
+#     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
+#     config_name=pathlib.Path(__file__).stem)
 
 class BaseWorkspace:
     include_keys = tuple()
